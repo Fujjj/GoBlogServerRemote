@@ -1,0 +1,22 @@
+#settings and logs
+config.yaml
+!config.example.yaml
+log/*.log
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
