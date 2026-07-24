@@ -12,6 +12,7 @@ log/*.log
 *.test
 *.out
 vendor/
+uploads/
 
 # IDE
 .idea/

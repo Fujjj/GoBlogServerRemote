@@ -4,6 +4,7 @@ import (
 	"server/global"
 	"server/model/database"
 
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
@@ -35,16 +36,27 @@ func (commentService *CommentService) DeleteCommentAndChildren(tx *gorm.DB, comm
 	if err := tx.Where("p_id=?", commentID).Find(&children).Error; err != nil {
 		return err
 	}
+	global.Log.Info("DeleteCommentAndChildren called",
+		zap.Uint("commentID", commentID),
+		zap.Int("childrenCount", len(children)),
+	)
 	//递归查找子评论的子评论，直到没有子评论
 	for _, child := range children {
+		global.Log.Info("Deleting child comment", zap.Uint("childID", child.ID), zap.Uint("parentID", commentID))
 		if err := commentService.DeleteCommentAndChildren(tx, child.ID); err != nil {
 			return err
 		}
 	}
 	//后序遍历，子->自己，先删除子评论再删除根评论，防止外键约束
-	if err := tx.Delete(&database.Comment{}, commentID).Error; err != nil {
+	//先加载评论，使 BeforeDelete hook 能访问到 ArticleID
+	var comment database.Comment
+	if err := tx.Where("id = ?", commentID).First(&comment).Error; err != nil {
 		return err
 	}
+	if err := tx.Delete(&comment).Error; err != nil {
+		return err
+	}
+	global.Log.Info("Comment deleted successfully", zap.Uint("commentID", commentID), zap.String("articleID", comment.ArticleID))
 	return nil
 }
 
