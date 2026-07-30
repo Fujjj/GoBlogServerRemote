@@ -366,6 +366,329 @@ go build -o server main.go
 
 ---
 
+## 项目部署
+### 开发工具及版本
+
+golang: 1.25.5
+
+node: v24.14.0
+
+docker: 29.2.1
+
+编译器：vscode、goland、webstorm
+
+### 编译文件
+编译后端，得到 main 文件
+
+```bash
+# windows环境下，打开项目所在目录，进入 server 文件夹，打开 cmd （不是 powershell）
+set GOOS=linux
+set GOARCH=amd64
+go mod tidy
+go build main.go
+```
+
+编译前端，得到 dist 文件夹
+//确保public/images目录下有必要的图片 如404页面图、QQ联系图、github图标、QQ图标...
+
+```bash
+# windows环境下，打开项目所在目录，进入 web 文件夹，打开 cmd
+npm install
+npm run build
+```
+
+#### 环境变量说明
+编译前检查 `.env.production` 文件：
+```bash
+# .env.production（编译时生效）
+VITE_API_BASE_URL=/api
+VITE_UPLOADS_URL=/uploads
+```
+
+| 变量 | 值 | 说明 |
+|------|------|------|
+| `VITE_API_BASE_URL` | `/api` | API 请求前缀，生产和开发都用 `/api`，开发环境 Vite proxy 转发到 `localhost:8080`，生产环境由 nginx 反向代理到后端 |
+| `VITE_UPLOADS_URL` | `/uploads` | 上传文件基础路径 |
+
+> **不需要**在生产环境将 `/api` 替换为完整域名（如 `https://www.your_domain/api`）。因为 nginx 统一代理 `/api/` 到 `127.0.0.1:8080`，使用相对路径 `/api` 即可，也避免了跨域问题。
+
+### 环境准备
+
+```bash
+# 安装 docker
+yum install -y docker-ce
+systemctl start docker
+systemctl enable docker
+
+# 安装 supervisor
+yum install -y supervisor
+
+# 安装 nginx
+yum install https://nginx.org/packages/centos/8/x86_64/RPMS/nginx-1.26.0-1.el8.ngx.x86_64.rpm
+```
+
+### 挂载服务
+#### redis
+```bash
+docker run -d \
+  --name blog-redis \
+  --restart always \
+  -p 6379:6379 \
+  -v /opt/go_blog/server/data/redis/data:/data \
+  --memory 256m \
+  redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+
+#   -v /opt/go_blog/server/data/redis/data:/data \是在 Docker 中将宿主机的 Redis 数据目录挂载到容器内，实现 Redis 数据的持久化存储。
+
+# --memory 256m 限制容器可以使用的最大内存为 256MB。
+
+# --maxmemory 128mb Redis 自身最多使用 128MB 内存
+
+# --maxmemory-policy allkeys-lru 当内存达到 128MB 时，自动淘汰最近最少使用的 key
+```
+
+#### MySQL
+```bash
+docker run -itd --name mysql --restart=always -p 3306:3306 -v /opt/go_blog/server/data/mysql/conf:/etc/mysql/conf.d -v /opt/go_blog/server/data/mysql/datadir:/var/lib/mysql -v /opt/go_blog/server/data/mysql/go_blog.sql:/opt/go_blog.sql -e  MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=blog_db mysql
+
+#  -v /opt/go_blog/server/data/mysql/conf:/etc/mysql/conf.d  是把宿主机的目录挂载到 MySQL 容器的配置目录 /etc/mysql/conf.d/ 
+
+# -v /opt/go_blog/server/data/mysql/datadir:/var/lib/mysql是在 Docker 中挂载数据卷（Volume Mount），实现 MySQL 数据的持久化存储（MySQL 容器运行时产生的所有数据库文件（表数据、日志等）实际上写入的是宿主机上的 /opt/go_blog/server/data/mysql/datadir，而不是仅在容器内部，即使容器被删除（docker rm），数据库数据依然保留在宿主机上。）。
+# /opt/go_blog/server/data/mysql 是主机（Host）上的目录路径
+# /var/lib/mysql是容器内的目录路径
+
+# -v /opt/go_blog/server/data/mysql/go_blog.sql:/opt/go_blog.sql是在 Docker 中将宿主机上的一个 SQL 文件挂载到容器内部，让容器能够读取/执行这个文件
+```
+
+#### elasticsearch 
+
+elasticsearch 无法直接数据卷挂载本地，需要先启动一个不挂载数据卷的容器，将文件复制到本地，再进行挂载
+
+Elasticsearch 对权限和系统参数要求很严格，条件不满足时就会启动失败
+Elasticsearch 8.x 容器内以 UID 1000 运行，宿主机目录必须属于 1000:1000
+ES 要求 vm.max_map_count >= 262144
+
+```bash
+# 最新
+mkdir -p /opt/go_blog/server/data/es/{data,config,plugins}
+chown -R 1000:1000 /opt/go_blog/server/data/es
+
+sysctl -w vm.max_map_count=262144
+echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+
+docker run -d \
+  --name es \
+  --restart always \
+  -p 127.0.0.1:9200:9200 \
+  -v /opt/go_blog/server/data/es/data:/usr/share/elasticsearch/data \
+  -v /opt/go_blog/server/data/es/config:/usr/share/elasticsearch/config \
+  -v /opt/go_blog/server/data/es/plugins:/usr/share/elasticsearch/plugins \
+  -e "discovery.type=single-node" \
+  -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" \
+  -e "xpack.security.enabled=false" \
+  -e "xpack.security.http.ssl.enabled=false" \
+  -e "xpack.license.self_generated.type=trial" \
+  -e "bootstrap.memory_lock=true" \
+  --memory 1g \
+  --ulimit memlock=-1:-1 \
+  elasticsearch:8.17.0
+
+# -v /opt/go_blog/server/data/es/data:/usr/share/elasticsearch/data  ES 的索引、分片、文档等实际写入宿主机磁盘，容器删除后数据不丢失。
+
+# -v /opt/go_blog/server/data/es/config:/usr/share/elasticsearch/config 以后想改 ES 配置（如安装 IK 分词器后改 analysis 配置），直接编辑宿主机上的文件即可，不用进容器。
+
+# -v /opt/go_blog/server/data/es/plugins:/usr/share/elasticsearch/plugins 安装插件（如中文 IK 分词器）时，把插件文件放到宿主机的这个目录，重启容器即可生效。
+
+# -e "discovery.type=single-node" 设置环境变量，以单节点模式运行，不尝试加入集群
+
+# -e "ES_JAVA_OPTS=-Xms512m -Xmx512m" JVM 初始堆和最大堆内存为512MB
+
+#-e "xpack.security.http.ssl.enabled=false" 关闭 X-Pack 安全认证
+
+# -e "xpack.security.http.ssl.enabled=false" 关闭 HTTPS，使用 HTTP 访问
+
+# xpack.license.self_generated.type=trial 使用 试用版许可证
+
+# bootstrap.memory_lock=true 启动时锁定 JVM 堆内存，防止被操作系统交换（swap）到磁盘
+
+# --memory 1g 限制容器最多使用 1GB 内存（操作系统层面的 cgroup 限制）
+
+# --ulimit memlock=-1:-1  无限制地锁定内存配合--memory 1g使用
+```
+
+### 服务端目录与权限配置
+
+将文件按照下述目录上传
+
+```bash
+# /opt/go_blog
+├── go_blog
+    ├── server
+    │   ├── data
+    │   │   ├── es
+        │   └── mysql
+    │   ├── main
+    │   └── config.yaml
+    └── web
+        └── dist
+```
+
+将main的权限从644修改为755，并初始化项目
+``` bash
+cd /opt/go_blog/server/
+chmod +x ./main
+```
+
+### 配置supervisord
+``` bash
+vim /etc/supervisord.d/go_blog.ini
+```
+```ini
+[program: go_blog]
+command=/opt/go_blog/server/main
+directory=/opt/go_blog/server/
+autorestart=true ; 程序意外退出是否自动重启
+autostart=true ; 是否自动启动
+user=root ; 进程执行的用户身份
+stopsignal=INT
+startsecs=1 ; 自动重启间隔
+stopasgroup=true ;默认为false,进程被杀死时，是否向这个进程组发送stop信号，包括子进程
+killasgroup=true ;默认为false，向进程组发送kill信号，包括子进程
+```
+ESC :wq 保存并退出，启动并一直开启supervisord
+```bash
+systemctl start supervisord
+systemctl enable supervisord
+```
+
+### 配置nginx
+修改 /etc/nginx/nginx.conf
+```nginx
+
+user  root;
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log notice;
+pid        /var/run/nginx.pid;
+
+
+events {
+    worker_connections  1024;
+}
+
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    
+    client_max_body_size 20M; #上传文件大小限制
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    keepalive_timeout  65;
+
+    #gzip  on;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+然后删除etc/nginx/conf.d 下的default.conf
+创建 /etc/nginx/conf.d/nginx.conf
+
+**将 your_domain 替换为你的域名**，请自行获取 ssl 证书，上传证书文件至 /etc/nginx/cert/
+
+```nginx
+server {
+    listen 80;
+    server_name your_domain www.your_domain;
+    return 301 https://www.your_domain$request_uri;
+}
+
+server { 
+    listen 443 ssl; 
+    server_name your_domain;  # 仅匹配非 www 的域名
+    ssl_certificate /etc/nginx/cert/your_domain.crt; # 证书公钥
+    ssl_certificate_key /etc/nginx/cert/your_domain.key; # 证书私钥
+    return 301 https://www.your_domain$request_uri;  # 强制跳转到 www.your_domain
+}
+
+server {
+    gzip on;
+    gzip_vary on;
+    gzip_disable "MSIE [1-6]\.";
+    gzip_static on;
+    gzip_min_length 256;
+    gzip_buffers 32 8k;
+    gzip_http_version 1.1;
+    gzip_comp_level 5;
+    gzip_proxied any;
+    gzip_types text/plain text/css text/xml application/javascript application/x-javascript application/xml application/xml+rss application/emacscript application/json image/svg+xml;
+
+    listen 443 ssl;
+    server_name www.your_domain; # 多个域名⽤空格分开 
+    ssl_certificate /etc/nginx/cert/your_domain.crt; # 证书公钥
+    ssl_certificate_key /etc/nginx/cert/your_domain.key; # 证书私钥
+    ssl_session_timeout 5m; 
+    ssl_session_cache shared:MozSSL:10m;  # 设置会话缓存以提⾼性能 
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;  # 配置加密算法 
+    ssl_protocols TLSv1.2 TLSv1.3;  # 配置加密协议 
+    ssl_prefer_server_ciphers on;
+
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always; #可选配置，开启HSTS 
+    add_header X-Frame-Options DENY; # 可选配置，防⽌点击劫持 
+    add_header X-Content-Type-Options nosniff; # 可选配置，防⽌MIME类型嗅探 
+    add_header X-XSS-Protection "1; mode=block"; # 可选配置，防⽌XSS攻击
+
+    location / {
+        try_files $uri $uri/ /index.html;
+        root   /opt/go_blog/web/dist;
+        index  index.html index.htm;
+    }
+
+    location /api/ {
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header REMOTE-HOST $remote_addr;
+        proxy_pass http://127.0.0.1:8080/api/;
+    }
+
+    location /image {
+        alias /opt/go_blog/web/dist/image;
+    }
+
+    location /emoji {
+        alias /opt/go_blog/web/dist/emoji;
+    }
+
+    location /uploads/ {
+        alias /opt/go_blog/server/uploads/;
+    }
+}
+```
+#### 启动 nginx
+```bash
+systemctl start nginx
+systemctl enable nginx
+```
+
+### 启动后端服务
+
+```bash
+cd /opt/go_blog/server/
+./main -sql
+./main -es
+# 若之前有数据库备份文件可执行 如./main -sql-import ./mysql_20250214.sql 恢复数据库
+# 若之前有eS备份文件可执行 如./main -es-import ./es_20250214.json 恢复es
+./main
+```
+
 ## 📄 License
 
 MIT
